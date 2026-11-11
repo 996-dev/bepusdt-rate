@@ -1,0 +1,49 @@
+name: rates-sync
+
+# 每 30 分钟刷新 api/v3/simple/price（BEpusdt 汇率同步源，经 jsDelivr 供网关拉取）。
+# 放在 GitHub Actions 里跑的原因：生产网关与本机都无法直连 CoinGecko，runner 可以。
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rates-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Sync rates
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COINGECKO_KEY: ${{ secrets.COINGECKO_KEY }}
+        run: node scripts/update-rates.mjs
+
+      - name: Verify via jsDelivr (网关实际走的通道)
+        if: always()
+        run: |
+          set -e
+          URL="https://fastly.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/api/v3/simple/price?ids=tether,usd-coin,tron,binancecoin,ethereum,the-open-network&vs_currencies=USD,CNY"
+          for i in 1 2 3 4 5; do
+            BODY=$(curl -sS --max-time 20 "$URL" -H 'cache-control: no-cache' || true)
+            echo "attempt $i: ${BODY:0:300}"
+            if echo "$BODY" | grep -q '"usdt"\|"tether"'; then
+              echo "jsDelivr serving payload OK"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "jsDelivr 未返回有效 payload（网关可能拿到 404/陈旧缓存）"
+          exit 1
