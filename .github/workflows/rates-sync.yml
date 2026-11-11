@@ -1,7 +1,10 @@
 name: rates-sync
 
-# 每 30 分钟刷新 api/v3/simple/price（BEpusdt 汇率同步源，经 jsDelivr 供网关拉取）。
-# 放在 GitHub Actions 里跑的原因：生产网关与本机都无法直连 CoinGecko，runner 可以。
+# 每 30 分钟刷新 api/v3/simple/price（BEpusdt 的汇率同步源）。
+# 为什么不跑在本地/网关：两边都访问不了 api.coingecko.com，GitHub runner 可以。
+# 消费方：网关 conf rate_sync_coingecko_api_url =
+#   https://gh-proxy.com/raw.githubusercontent.com/996-dev/bepusdt-rate/main
+#   （jsDelivr 分支引用有 ~12h 解析缓存，purge 清不到，只作备用：fastly.jsdelivr.net/gh/996-dev/bepusdt-rate@main）
 on:
   schedule:
     - cron: '*/30 * * * *'
@@ -17,7 +20,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
 
@@ -31,19 +34,25 @@ jobs:
           COINGECKO_KEY: ${{ secrets.COINGECKO_KEY }}
         run: node scripts/update-rates.mjs
 
-      - name: Verify via jsDelivr (网关实际走的通道)
-        if: always()
+      - name: Verify production channel (gh-proxy → raw)
         run: |
           set -e
-          URL="https://fastly.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/api/v3/simple/price?ids=tether,usd-coin,tron,binancecoin,ethereum,the-open-network&vs_currencies=USD,CNY"
+          URL="https://gh-proxy.com/raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/api/v3/simple/price?ids=tether,usd-coin,tron,binancecoin,ethereum,the-open-network&vs_currencies=USD,CNY"
           for i in 1 2 3 4 5; do
-            BODY=$(curl -sS --max-time 20 "$URL" -H 'cache-control: no-cache' || true)
-            echo "attempt $i: ${BODY:0:300}"
-            if echo "$BODY" | grep -q '"usdt"\|"tether"'; then
-              echo "jsDelivr serving payload OK"
+            BODY=$(curl -sS --max-time 25 "$URL" -H 'cache-control: no-cache' || true)
+            echo "attempt $i: ${BODY:0:200}"
+            if echo "$BODY" | grep -q '"tether"'; then
+              echo "production channel OK"
               exit 0
             fi
             sleep 10
           done
-          echo "jsDelivr 未返回有效 payload（网关可能拿到 404/陈旧缓存）"
+          echo "生产通道未返回有效 payload —— 网关会继续用旧汇率，需要人工介入"
           exit 1
+
+      - name: Verify jsDelivr (backup, branch ref may lag)
+        continue-on-error: true
+        run: |
+          URL="https://fastly.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/api/v3/simple/price?ids=tether&vs_currencies=usd"
+          BODY=$(curl -sS --max-time 25 "$URL" || true)
+          echo "jsdelivr: ${BODY:0:200}"
